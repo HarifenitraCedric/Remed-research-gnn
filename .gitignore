@@ -1,0 +1,30 @@
+# Dossiers Python
+__pycache__/
+*.pyc
+venv/
+env/
+.venv/
+
+# Fichiers de données volumineux (ne pas pousser vers GitHub)
+*.csv
+*.xlsx
+*.sqlite
+*.db
+
+# Modèles et embeddings (fichiers .pt et .npy)
+*.pt
+*.npy
+
+# Variables d'environnement
+.env
+
+# Dossiers de données (si tu en as créé)
+data/
+assets/
+
+# Fichiers générés par VS Code
+.vscode/
+*.code-workspace
+
+# Jupyter Notebook (optionnel, mais souvent lourd)
+.ipynb_checkpoints/

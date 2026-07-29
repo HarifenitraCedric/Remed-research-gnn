@@ -16,10 +16,12 @@ mapping = pd.read_csv("mapping_atc_final.csv")
 # capturées car le nom de marque ne contient pas la DCI et
 # denomination_substance n'est pas renseigné.
 MANUEL_MARQUES = {
-    "DOLIPRANE": "N02BE01",   # paracétamol
-    "DAFALGAN": "N02BE01",    # paracétamol
-    "TOVIAZ": "G04BD11",      # fésotérodine
-    "MOVICOL": "A06AD65",     # macrogol (association)
+    "DOLIPRANE": "N02BE01",      # paracétamol
+    "DAFALGAN": "N02BE01",       # paracétamol
+    "TOVIAZ": "G04BD11",         # fésotérodine
+    "MOVICOL": "A06AD65",        # macrogol (association)
+    "ACIDE FOLIQUE": "B03BB01",  # acide folique -- exclu du matching automatique
+                                  # depuis la correction du mot générique "acide"
 }
 
 def matcher_marque_manuelle(nom):

@@ -29,7 +29,6 @@ MOTS_SEL = {
     "hemihydrate", "sodique", "sodium", "potassique", "potassium",
     "calcique", "calcium", "magnesique", "magnesium", "sel", "de", "du",
     "des", "d", "la", "le", "les", "dl", "l", "et",
-    "acide", "acid",
 }
 
 
@@ -64,26 +63,7 @@ tous_les_tokens_who = list(index_tokens.keys())
 cache_matching = {}
 
 
-# Corrections manuelles pour des molécules dont la correspondance floue
-# automatique s'est avérée incorrecte lors de la validation manuelle des
-# résultats. Vérifiées AVANT le matching automatique, et prioritaires sur
-# lui. None = volontairement exclu (mieux vaut ne pas matcher que mal
-# matcher).
-#
-# ACIDE FUSIDIQUE : le token "fusidique" seul (après filtrage du mot
-# générique "acide") peut, selon les versions du référentiel OMS installé,
-# être apparié à tort à un tout autre principe actif (ex: acide
-# acétylsalicylique / aspirine), créant une contre-indication fictive entre
-# des statines et l'aspirine alors que la vraie interaction ANSM concerne
-# l'acide fusidique (antibiotique), pas l'aspirine. Exclu par sécurité.
-CORRECTIONS_MANUELLES_MOLECULES = {
-    "ACIDE FUSIDIQUE": None,
-}
-
-
 def molecule_vers_atc(nom_molecule, seuil=0.82):
-    if nom_molecule in CORRECTIONS_MANUELLES_MOLECULES:
-        return CORRECTIONS_MANUELLES_MOLECULES[nom_molecule]
     if nom_molecule in cache_matching:
         return cache_matching[nom_molecule]
     tokens = tokens_significatifs(normaliser(nom_molecule))

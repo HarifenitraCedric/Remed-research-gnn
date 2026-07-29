@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
@@ -70,76 +71,77 @@ class ModelService:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def load_artifacts(
-        self,
-        weights_path: str = "remed_gnn_weights.pt",
-        mappings_path: str = "mappings_remed.json",
-        graphe_path: str = "graphe_heterogene_complet.pt"
-    ):
-        if not os.path.exists(mappings_path):
-            raise FileNotFoundError(f"Fichier de mappings introuvable : {mappings_path}")
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"Fichier de poids introuvable : {weights_path}")
-        if not os.path.exists(graphe_path):
-            raise FileNotFoundError(f"Fichier de graphe introuvable : {graphe_path}")
+            self,
+            weights_path: str = "remed_gnn_weights.pt",
+            mappings_path: str = "mappings_remed.json",
+            graphe_path: str = "graphe_heterogene_complet.pt"
+        ):
+            # 0. Résolution absolue du répertoire courant de app_api.py (05_api_deploiement)
+            base_dir = Path(__file__).resolve().parent
 
-        # 1. Chargement du dictionnaire JSON
-        with open(mappings_path, "r", encoding="utf-8") as f:
-            self.mappings = json.load(f)
+            full_mappings_path = base_dir / mappings_path
+            full_weights_path = base_dir / weights_path
+            full_graphe_path = base_dir / graphe_path
 
-        self.med_to_idx = self.mappings.get("med_to_idx", {})
-        self.idx_to_class = self.mappings.get("idx_to_class", {})
-        self.cis_to_med = self.mappings.get("cis_to_med", {})
-        metadata = self.mappings.get("metadata", {})
+            if not full_mappings_path.exists():
+                raise FileNotFoundError(f"Fichier de mappings introuvable : {full_mappings_path}")
+            if not full_weights_path.exists():
+                raise FileNotFoundError(f"Fichier de poids introuvable : {full_weights_path}")
+            if not full_graphe_path.exists():
+                raise FileNotFoundError(f"Fichier de graphe introuvable : {full_graphe_path}")
 
-        # 2. Chargement de la structure du graphe
-        data = torch.load(graphe_path, weights_only=False)
-        self.data_bidirect = T.ToUndirected()(data).to(self.device)
+            # 1. Chargement du dictionnaire JSON
+            with open(full_mappings_path, "r", encoding="utf-8") as f:
+                self.mappings = json.load(f)
 
-        # 3. Instanciation du modèle et chargement des poids
-        num_patients = metadata.get("num_patients", self.data_bidirect['patient'].num_nodes)
-        num_meds = metadata.get("num_medicaments", self.data_bidirect['medicament'].num_nodes)
+            self.med_to_idx = self.mappings.get("med_to_idx", {})
+            self.idx_to_class = self.mappings.get("idx_to_class", {})
+            self.cis_to_med = self.mappings.get("cis_to_med", {})
+            metadata = self.mappings.get("metadata", {})
 
-        self.model = RemedHeteroGNN(
-            num_patients=num_patients,
-            num_meds=num_meds,
-            embed_dim=64,
-            hidden_dim=32,
-            out_dim=16
-        )
+            # 2. Chargement de la structure du graphe
+            data = torch.load(full_graphe_path, weights_only=False)
+            self.data_bidirect = T.ToUndirected()(data).to(self.device)
 
-        state_dict = torch.load(weights_path, map_location=self.device)
-        self.model.load_state_dict(state_dict)
-        self.model.to(self.device)
-        self.model.eval()
+            # 3. Instanciation du modèle et chargement des poids
+            num_patients = metadata.get("num_patients", self.data_bidirect['patient'].num_nodes)
+            num_meds = metadata.get("num_medicaments", self.data_bidirect['medicament'].num_nodes)
 
-        print(f"[OK] Modèle RemedHeteroGNN et graphe chargés sur {self.device}.")
+            self.model = RemedHeteroGNN(
+                num_patients=num_patients,
+                num_meds=num_meds,
+                embed_dim=64,
+                hidden_dim=32,
+                out_dim=16
+            )
+
+            state_dict = torch.load(full_weights_path, map_location=self.device)
 
     def resolve_med_index(self, identifier: str) -> int:
-        """
-        Résout un identifiant (ex: 'MED_0', '0', ou '60002283') vers son index entier.
-        """
-        clean_id = str(identifier).strip()
+            """
+            Résout un identifiant vers son index entier dans le graphe (ex: 'B01AF02', 'b01af02', '60002283').
+            """
+            clean_id = str(identifier).strip().upper()
 
-        # 1. Correspondance directe dans med_to_idx (ex: "MED_0")
-        if clean_id in self.med_to_idx:
-            return self.med_to_idx[clean_id]
+            # 1. Correspondance directe (ex: Code ATC 'B01AF02')
+            if clean_id in self.med_to_idx:
+                return self.med_to_idx[clean_id]
 
-        # 2. Essai avec ajout du préfixe MED_ (ex: l'utilisateur envoie "0" -> "MED_0")
-        formatted_med = f"MED_{clean_id}"
-        if formatted_med in self.med_to_idx:
-            return self.med_to_idx[formatted_med]
+            # 2. Cas où l'utilisateur envoie une variante sans espace/majuscule
+            for key in self.med_to_idx:
+                if key.upper() == clean_id:
+                    return self.med_to_idx[key]
 
-        # 3. Essai via le mapping CIS -> MED_ (ex: "60002283" -> "MED_12")
-        if self.cis_to_med and clean_id in self.cis_to_med:
-            internal_code = self.cis_to_med[clean_id]
-            if internal_code in self.med_to_idx:
-                return self.med_to_idx[internal_code]
+            # 3. Correspondance via mapping CIS -> ATC (si présent)
+            if self.cis_to_med and clean_id in self.cis_to_med:
+                internal_code = self.cis_to_med[clean_id]
+                if internal_code in self.med_to_idx:
+                    return self.med_to_idx[internal_code]
 
-        # Si aucune correspondance n'est trouvée
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Médicament '{identifier}' introuvable (ni sous forme 'MED_x', ni code CIS valide)."
-        )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Médicament / Code ATC '{identifier}' introuvable dans le dictionnaire du modèle GNN."
+            )
 
 
 service = ModelService()

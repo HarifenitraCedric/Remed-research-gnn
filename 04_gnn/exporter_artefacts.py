@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, SAGEConv
 import torch_geometric.transforms as T
 import pandas as pd
+import os
 
 
 class RemedHeteroGNN(nn.Module):
@@ -75,7 +76,20 @@ class RemedHeteroGNN(nn.Module):
 # ---------------------------------------------------------------------------
 # 1. Chargement du graphe
 # ---------------------------------------------------------------------------
-data = torch.load("graphe_heterogene_complet.pt", weights_only=False)
+def charger_torch_safe(chemin_relatif):
+  nom_fichier = os.path.basename(chemin_relatif)
+  if os.path.exists(nom_fichier):
+    return torch.load(nom_fichier, weights_only=False)
+  elif os.path.exists(chemin_relatif):
+    return torch.load(chemin_relatif, weights_only=False)
+  else:
+    raise FileNotFoundError(
+        f"Impossible de trouver {nom_fichier} ou {chemin_relatif}"
+    )
+
+
+data = charger_torch_safe("04_gnn/graphe_heterogene_complet.pt") 
+
 data_bidirect = T.ToUndirected()(data)
 rel = ('medicament', 'interagit_avec', 'medicament')
 labels_complet = torch.argmax(data_bidirect[rel].edge_attr, dim=-1)
@@ -89,7 +103,21 @@ proportions_reelles = {
     c: (labels_complet == c).sum().item() / len(labels_complet) for c in range(4)
 }
 
-thesaurus = pd.read_csv("interactions_thesaurus_global.csv")
+def lire_csv_safe(chemin_relatif):
+  nom_fichier = os.path.basename(chemin_relatif)
+  if os.path.exists(nom_fichier):
+    return pd.read_csv(nom_fichier)
+  elif os.path.exists(chemin_relatif):
+    return pd.read_csv(chemin_relatif)
+  else:
+    raise FileNotFoundError(
+        f"Impossible de trouver {nom_fichier} ou {chemin_relatif}"
+    )
+
+
+thesaurus = lire_csv_safe(
+    "02_interactions_ansm/créer_interaction_graphe/interactions_thesaurus_global.csv"
+)
 proportions_attendues = thesaurus["gravite"].value_counts(normalize=True).to_dict()
 
 print("=== Détection automatique de l'ordre des classes ===")
@@ -140,7 +168,20 @@ for epoch in range(1, 101):
     loss.backward()
     optimizer.step()
 
-torch.save(model_final.state_dict(), "remed_gnn_weights.pt")
+def sauvegarder_torch_safe(chemin_relatif, obj):
+  nom_fichier = os.path.basename(chemin_relatif)
+  if os.path.basename(os.getcwd()) == "_run_pipeline" or not os.path.exists(
+      os.path.dirname(chemin_relatif)
+  ):
+    torch.save(obj, nom_fichier)
+  else:
+    os.makedirs(os.path.dirname(chemin_relatif), exist_ok=True)
+    torch.save(obj, chemin_relatif)
+
+
+sauvegarder_torch_safe(
+    "04_gnn/exporter_artefacts/remed_gnn_weights.pt", model_final.state_dict()
+)
 print("✓ Poids sauvegardés : remed_gnn_weights.pt")
 
 # ---------------------------------------------------------------------------
@@ -164,6 +205,22 @@ mappings_payload = {
     },
 }
 
-with open("mappings_remed.json", "w", encoding="utf-8") as f:
-    json.dump(mappings_payload, f, ensure_ascii=False, indent=2)
+def sauvegarder_json_safe(chemin_relatif, obj):
+  nom_fichier = os.path.basename(chemin_relatif)
+  target_path = (
+      nom_fichier
+      if os.path.basename(os.getcwd()) == "_run_pipeline"
+      or not os.path.exists(os.path.dirname(chemin_relatif))
+      else chemin_relatif
+  )
+  if os.path.dirname(target_path):
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+  with open(target_path, "w", encoding="utf-8") as f:
+    json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+sauvegarder_json_safe(
+    "04_gnn/exporter_artefacts/mappings_remed.json", mappings_payload
+)
+
 print("✓ Mappings sauvegardés (avec ordre de classes vérifié) : mappings_remed.json")

@@ -24,6 +24,8 @@ MOTS_SEL = {
     "hemihydrate", "sodique", "sodium", "potassique", "potassium",
     "calcique", "calcium", "magnesique", "magnesium", "sel", "de", "du",
     "des", "d", "la", "le", "les", "dl", "l", "et",
+    "acide", "acid",  # mots trop génériques : provoquaient un faux match
+    # (ex. "ACIDE FOLIQUE" apparié à "acetylsalicylic ACID" via ce seul mot)
 }
 
 

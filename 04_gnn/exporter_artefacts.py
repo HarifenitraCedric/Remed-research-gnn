@@ -1,38 +1,28 @@
 """
-Export des artefacts de déploiement (poids + mappings), CORRIGÉ.
+Export des artefacts de déploiement (poids + mappings), VERSION FINALE NETTOYÉE.
 
-Bug corrigé : le class_mapping était écrit EN DUR, en supposant que l'ordre
-du one-hot encoding suivait l'ordre "naturel" de gravité croissante
-(a_prendre_en_compte, precaution_emploi, association_deconseillee,
-contre_indication). Ce n'est pas le cas -- l'ordre réel dépend de l'ordre
-d'apparition des valeurs dans le script qui a construit
-graphe_heterogene_complet.pt (probablement un get_dummies ou un encodage par
-ordre alphabétique).
-
-Conséquence du bug (vérifiée empiriquement) : la classe 2 (2,6% des
-exemples, correspondant à 'contre_indication') était étiquetée
-'association_deconseillee' dans l'API -- une vraie contre-indication
-s'affichait comme un risque moindre. C'est l'inverse de ce qu'on veut pour
-un outil médical.
-
-Correction : l'ordre est déterminé ICI, automatiquement, en comparant la
-proportion de chaque classe (argmax du one-hot du graphe) à la proportion
-connue de chaque gravité dans interactions_ansm.csv -- au lieu de la
-supposer. Le mapping résultant est affiché explicitement pour vérification
-visuelle avant sauvegarde.
+Inclusions & Corrections :
+1. Résolution dynamique des chemins de fichiers (compatibilité avec exécution 
+   depuis la racine du projet ou depuis le sous-dossier 04_gnn).
+2. Alignment des codes ATC sur la base de données réelle (medications.csv, 179 codes)
+   au lieu d'extraire la liste obsolète du fichier .pt (94 codes).
+3. Détection automatique du mapping de gravité (ordre des 4 classes d'interactions ANSM).
 """
 
 import json
+import os
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import HeteroConv, SAGEConv
 import torch_geometric.transforms as T
-import pandas as pd
-import os
+from torch_geometric.nn import HeteroConv, SAGEConv
 
 
+# ---------------------------------------------------------------------------
+# Architecture du Réseau de Neurones GNN
+# ---------------------------------------------------------------------------
 class RemedHeteroGNN(nn.Module):
     def __init__(self, num_patients, num_meds, embed_dim, hidden_dim, out_dim):
         super().__init__()
@@ -74,50 +64,67 @@ class RemedHeteroGNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 1. Chargement du graphe
+# Utilitaires de gestion robuste des fichiers et chemins
 # ---------------------------------------------------------------------------
+def trouver_chemin_fichier(nom_ou_chemin_relatif):
+    """
+    Tente de localiser un fichier en testant plusieurs chemins plausibles 
+    selon le sous-dossier d'exécution courant.
+    """
+    chemins_a_tester = [
+        nom_ou_chemin_relatif,
+        os.path.basename(nom_ou_chemin_relatif),
+        os.path.join("..", nom_ou_chemin_relatif),
+        os.path.join("04_gnn", os.path.basename(nom_ou_chemin_relatif)),
+        os.path.join("..", "02_interactions_ansm", "créer_interaction_graphe", os.path.basename(nom_ou_chemin_relatif)),
+    ]
+    for p in chemins_a_tester:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"Impossible de localiser le fichier : {nom_ou_chemin_relatif}")
+
+
 def charger_torch_safe(chemin_relatif):
-  nom_fichier = os.path.basename(chemin_relatif)
-  if os.path.exists(nom_fichier):
-    return torch.load(nom_fichier, weights_only=False)
-  elif os.path.exists(chemin_relatif):
-    return torch.load(chemin_relatif, weights_only=False)
-  else:
-    raise FileNotFoundError(
-        f"Impossible de trouver {nom_fichier} ou {chemin_relatif}"
-    )
+    target = trouver_chemin_fichier(chemin_relatif)
+    return torch.load(target, weights_only=False)
 
 
-data = charger_torch_safe("04_gnn/graphe_heterogene_complet.pt") 
+def lire_csv_safe(chemin_relatif):
+    target = trouver_chemin_fichier(chemin_relatif)
+    return pd.read_csv(target)
 
+
+def sauvegarder_torch_safe(chemin_relatif, obj):
+    dossier = os.path.dirname(chemin_relatif)
+    if dossier and not os.path.exists(dossier):
+        os.makedirs(dossier, exist_ok=True)
+    torch.save(obj, chemin_relatif)
+
+
+def sauvegarder_json_safe(chemin_relatif, obj):
+    dossier = os.path.dirname(chemin_relatif)
+    if dossier and not os.path.exists(dossier):
+        os.makedirs(dossier, exist_ok=True)
+    with open(chemin_relatif, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# 1. Chargement du graphe d'origine
+# ---------------------------------------------------------------------------
+data = charger_torch_safe("graphe_heterogene_complet.pt")
 data_bidirect = T.ToUndirected()(data)
 rel = ('medicament', 'interagit_avec', 'medicament')
 labels_complet = torch.argmax(data_bidirect[rel].edge_attr, dim=-1)
 
 # ---------------------------------------------------------------------------
-# 2. Détermination AUTOMATIQUE de l'ordre réel des classes, en comparant les
-#    proportions observées aux proportions connues du thésaurus ANSM
-#    (interactions_thesaurus_global.csv, seule source de vérité de gravité)
+# 2. Détection automatique de l'ordre réel des classes ANSM
 # ---------------------------------------------------------------------------
 proportions_reelles = {
     c: (labels_complet == c).sum().item() / len(labels_complet) for c in range(4)
 }
 
-def lire_csv_safe(chemin_relatif):
-  nom_fichier = os.path.basename(chemin_relatif)
-  if os.path.exists(nom_fichier):
-    return pd.read_csv(nom_fichier)
-  elif os.path.exists(chemin_relatif):
-    return pd.read_csv(chemin_relatif)
-  else:
-    raise FileNotFoundError(
-        f"Impossible de trouver {nom_fichier} ou {chemin_relatif}"
-    )
-
-
-thesaurus = lire_csv_safe(
-    "02_interactions_ansm/créer_interaction_graphe/interactions_thesaurus_global.csv"
-)
+thesaurus = lire_csv_safe("interactions_thesaurus_global.csv")
 proportions_attendues = thesaurus["gravite"].value_counts(normalize=True).to_dict()
 
 print("=== Détection automatique de l'ordre des classes ===")
@@ -126,7 +133,6 @@ print(f"{'Classe':<8}{'% observé':<12}{'Gravité correspondante':<28}{'% attend
 mapping_detecte = {}
 gravites_deja_prises = set()
 for classe_idx, prop_obs in sorted(proportions_reelles.items(), key=lambda x: x[0]):
-    # Trouve la gravité dont la proportion attendue est la plus proche
     meilleure_gravite, meilleur_ecart = None, float("inf")
     for gravite, prop_att in proportions_attendues.items():
         if gravite in gravites_deja_prises:
@@ -138,19 +144,33 @@ for classe_idx, prop_obs in sorted(proportions_reelles.items(), key=lambda x: x[
     gravites_deja_prises.add(meilleure_gravite)
     print(f"{classe_idx:<8}{prop_obs:<12.1%}{meilleure_gravite:<28}{proportions_attendues[meilleure_gravite]:<10.1%}")
 
-print(f"\nMapping détecté : {mapping_detecte}")
-print("⚠️  VÉRIFIEZ VISUELLEMENT que les % observé et attendu se correspondent "
-      "bien ligne par ligne avant de faire confiance à ce mapping.")
+print(f"\nMapping détecté : {mapping_detecte}\n")
 
 # ---------------------------------------------------------------------------
-# 3. Entraînement final (identique à train_heterognn_v2.py, sur tout le graphe)
+# 3. Alignement des médicaments depuis medications.csv (179 codes ATC)
 # ---------------------------------------------------------------------------
-print("\n🔄 Entraînement final du modèle sur l'ensemble des données...")
+meds_df = lire_csv_safe("medications.csv")
+atc_codes = meds_df['code_atc'].dropna().astype(str).str.strip().str.upper().unique()
+atc_codes = sorted([code for code in atc_codes if code and code != 'NAN'])
+
+# Génération du dictionnaire complet med_to_idx
+med_mapping = {atc_code: idx for idx, atc_code in enumerate(atc_codes)}
+num_meds_total = len(med_mapping)
+
+print(f"✓ Dictionnaire de médicaments aligné sur medications.csv : {num_meds_total} codes ATC retenus.")
+
+# ---------------------------------------------------------------------------
+# 4. Entraînement final du modèle PyTorch
+# ---------------------------------------------------------------------------
+print("🔄 Entraînement final du modèle sur l'ensemble des données...")
 torch.manual_seed(42)
+
 model_final = RemedHeteroGNN(
-    num_patients=data_bidirect['patient'].num_nodes,
-    num_meds=data_bidirect['medicament'].num_nodes,
-    embed_dim=64, hidden_dim=32, out_dim=16,
+    num_patients=int(data_bidirect['patient'].num_nodes),
+    num_meds=num_meds_total,
+    embed_dim=64,
+    hidden_dim=32,
+    out_dim=16,
 )
 
 comptes = torch.bincount(labels_complet, minlength=4).float()
@@ -158,7 +178,11 @@ poids = (1.0 / comptes.clamp(min=1))
 poids = poids / poids.sum() * 4
 criterion = nn.CrossEntropyLoss(weight=poids)
 optimizer = torch.optim.Adam(model_final.parameters(), lr=0.01, weight_decay=5e-4)
-x_init = {'patient': model_final.patient_emb.weight, 'medicament': model_final.med_emb.weight}
+
+x_init = {
+    'patient': model_final.patient_emb.weight,
+    'medicament': model_final.med_emb.weight
+}
 
 model_final.train()
 for epoch in range(1, 101):
@@ -168,59 +192,24 @@ for epoch in range(1, 101):
     loss.backward()
     optimizer.step()
 
-def sauvegarder_torch_safe(chemin_relatif, obj):
-  nom_fichier = os.path.basename(chemin_relatif)
-  if os.path.basename(os.getcwd()) == "_run_pipeline" or not os.path.exists(
-      os.path.dirname(chemin_relatif)
-  ):
-    torch.save(obj, nom_fichier)
-  else:
-    os.makedirs(os.path.dirname(chemin_relatif), exist_ok=True)
-    torch.save(obj, chemin_relatif)
-
-
-sauvegarder_torch_safe(
-    "04_gnn/exporter_artefacts/remed_gnn_weights.pt", model_final.state_dict()
-)
-print("✓ Poids sauvegardés : remed_gnn_weights.pt")
+# Sauvegarde des poids du modèle
+sauvegarder_torch_safe("remed_gnn_weights.pt", model_final.state_dict())
+print("✓ Poids du modèle sauvegardés : remed_gnn_weights.pt")
 
 # ---------------------------------------------------------------------------
-# 4. Mapping médicament -> index (identique à avant, fallback générique)
+# 5. Exportation du dictionnaire Mappings au format JSON
 # ---------------------------------------------------------------------------
-if hasattr(data['medicament'], 'mapping_cis_to_idx'):
-    med_mapping = data['medicament'].mapping_cis_to_idx
-elif hasattr(data['medicament'], 'cis'):
-    med_mapping = {str(cis): idx for idx, cis in enumerate(data['medicament'].cis)}
-else:
-    num_meds = data['medicament'].num_nodes
-    med_mapping = {f"MED_{i}": i for i in range(num_meds)}
-
 mappings_payload = {
     "med_to_idx": med_mapping,
-    "idx_to_class": mapping_detecte,  # <-- mapping détecté automatiquement, pas supposé
+    "idx_to_class": mapping_detecte,
     "metadata": {
         "num_patients": int(data['patient'].num_nodes),
-        "num_medicaments": int(data['medicament'].num_nodes),
-        "embed_dim": 64, "hidden_dim": 32, "out_dim": 16,
+        "num_medicaments": num_meds_total,
+        "embed_dim": 64,
+        "hidden_dim": 32,
+        "out_dim": 16,
     },
 }
 
-def sauvegarder_json_safe(chemin_relatif, obj):
-  nom_fichier = os.path.basename(chemin_relatif)
-  target_path = (
-      nom_fichier
-      if os.path.basename(os.getcwd()) == "_run_pipeline"
-      or not os.path.exists(os.path.dirname(chemin_relatif))
-      else chemin_relatif
-  )
-  if os.path.dirname(target_path):
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-  with open(target_path, "w", encoding="utf-8") as f:
-    json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-sauvegarder_json_safe(
-    "04_gnn/exporter_artefacts/mappings_remed.json", mappings_payload
-)
-
-print("✓ Mappings sauvegardés (avec ordre de classes vérifié) : mappings_remed.json")
+sauvegarder_json_safe("mappings_remed.json", mappings_payload)
+print("✓ Mappings JSON sauvegardés : mappings_remed.json")

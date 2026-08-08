@@ -68,6 +68,7 @@ class ModelService:
         self.med_to_idx: Dict[str, int] = {}
         self.idx_to_class: Dict[str, str] = {}
         self.cis_to_med: Dict[str, str] = {}
+        self.ansm_edges_set: set = set()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def load_artifacts(
@@ -103,10 +104,18 @@ class ModelService:
             data = torch.load(full_graphe_path, weights_only=False)
             self.data_bidirect = T.ToUndirected()(data).to(self.device)
 
+            self.ansm_edges_set = set()
+            edge_type = ('medicament', 'interagit_avec', 'medicament')
+            if edge_type in data.edge_index_dict:
+                edges = data.edge_index_dict[edge_type]
+                for u, v in zip(edges[0].tolist(), edges[1].tolist()):
+                    self.ansm_edges_set.add((min(u, v), max(u, v)))
+
             # 3. Instanciation du modèle et chargement des poids
             num_patients = metadata.get("num_patients", self.data_bidirect['patient'].num_nodes)
             num_meds = metadata.get("num_medicaments", self.data_bidirect['medicament'].num_nodes)
 
+# --- CODE CORRIGÉ ---
             self.model = RemedHeteroGNN(
                 num_patients=num_patients,
                 num_meds=num_meds,
@@ -116,32 +125,45 @@ class ModelService:
             )
 
             state_dict = torch.load(full_weights_path, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            self.model.to(self.device)
+            self.model.eval()  # Désactive le Dropout pour l'inférence
 
+# --- CODE AMÉLIORÉ ---
     def resolve_med_index(self, identifier: str) -> int:
-            """
-            Résout un identifiant vers son index entier dans le graphe (ex: 'B01AF02', 'b01af02', '60002283').
-            """
-            clean_id = str(identifier).strip().upper()
+        clean_id = str(identifier).strip().upper()
 
-            # 1. Correspondance directe (ex: Code ATC 'B01AF02')
-            if clean_id in self.med_to_idx:
-                return self.med_to_idx[clean_id]
+        # 1. Correspondance directe (ex: 'MED_0', 'N06BX')
+        if clean_id in self.med_to_idx:
+            return self.med_to_idx[clean_id]
 
-            # 2. Cas où l'utilisateur envoie une variante sans espace/majuscule
-            for key in self.med_to_idx:
-                if key.upper() == clean_id:
-                    return self.med_to_idx[key]
+        # 2. Insensibilité à la casse
+        for key in self.med_to_idx:
+            if key.upper() == clean_id:
+                return self.med_to_idx[key]
 
-            # 3. Correspondance via mapping CIS -> ATC (si présent)
-            if self.cis_to_med and clean_id in self.cis_to_med:
-                internal_code = self.cis_to_med[clean_id]
-                if internal_code in self.med_to_idx:
-                    return self.med_to_idx[internal_code]
+        # 3. Traitement du préfixe "MED_" -> extraction de l'index numérique
+        if clean_id.startswith("MED_"):
+            raw_num = clean_id.replace("MED_", "")
+            if raw_num in self.med_to_idx:
+                return self.med_to_idx[raw_num]
+            try:
+                num_idx = int(raw_num)
+                if 0 <= num_idx < self.data_bidirect['medicament'].num_nodes:
+                    return num_idx
+            except ValueError:
+                pass
 
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Médicament / Code ATC '{identifier}' introuvable dans le dictionnaire du modèle GNN."
-            )
+        # 4. Correspondance via mapping CIS -> ATC
+        if self.cis_to_med and clean_id in self.cis_to_med:
+            internal_code = self.cis_to_med[clean_id]
+            if internal_code in self.med_to_idx:
+                return self.med_to_idx[internal_code]
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Médicament / Code ATC '{identifier}' introuvable dans le dictionnaire du modèle GNN."
+        )
 
 
 service = ModelService()
@@ -180,6 +202,7 @@ class PredictionResponse(BaseModel):
     class_id: int = Field(..., description="Index de la classe prédite (0, 1, 2, 3)")
     niveau_gravite: str = Field(..., description="Libellé de la gravité (ex: 'contre_indication')")
     probabilities: Dict[str, float] = Field(..., description="Probabilités pour chacune des 4 classes")
+    is_ansm: bool = Field(False, description="Vrai si l'interaction est issue du thésaurus ANSM, Faux si prédiction GNN pure")
 
 # --- NOUVEAUX SCHÉMAS POUR LE BATCH ---
 class BatchPredictionRequest(BaseModel):
@@ -191,6 +214,7 @@ class BatchPredictionRequest(BaseModel):
 class BatchPredictionResponse(BaseModel):
     nb_medicaments: int
     nb_paires_analysées: int
+    riskScore: float = Field(..., description="Score de risque global maximal calculé pour l'ordonnance (0 à 10)")
     interactions: List[PredictionResponse]
     erreurs_identification: List[Dict[str, str]]
 # =====================================================================
@@ -206,6 +230,14 @@ def health_check():
     }
 
 
+# Poids de gravité ANSM pour le calcul du score continu
+POIDS_GRAVITE = {
+    "contre_indication": 10.0,
+    "association_deconseillee": 7.0,
+    "precaution_emploi": 4.0,
+    "a_prendre_en_compte": 2.0,
+}
+
 @app.post("/predict-batch", response_model=BatchPredictionResponse)
 def predict_batch(payload: BatchPredictionRequest):
     if not service.model or not service.med_to_idx:
@@ -214,8 +246,13 @@ def predict_batch(payload: BatchPredictionRequest):
     meds = payload.medicaments
     n = len(meds)
     if n < 2:
-        return BatchPredictionResponse(nb_medicaments=n, nb_paires_analysées=0,
-                                        interactions=[], erreurs_identification=[])
+        return BatchPredictionResponse(
+            nb_medicaments=n,
+            nb_paires_analysées=0,
+            riskScore=0.0,
+            interactions=[],
+            erreurs_identification=[]
+        )
 
     # Résolution des indices, une seule fois
     indices, erreurs, meds_valides = [], [], []
@@ -229,39 +266,55 @@ def predict_batch(payload: BatchPredictionRequest):
     interactions = []
     if len(indices) >= 2:
         with torch.no_grad():
-            # --- UN SEUL forward de l'encodeur pour tout le lot ---
             x_initial_dict = {
                 'patient': service.model.patient_emb.weight,
                 'medicament': service.model.med_emb.weight,
             }
             z_dict = service.model.encode(x_initial_dict, service.data_bidirect.edge_index_dict)
 
-            # Construction de toutes les paires d'un coup
             paires = [(i, j) for i in range(len(indices)) for j in range(i + 1, len(indices))]
             src = torch.tensor([indices[i] for i, j in paires], device=service.device)
             dst = torch.tensor([indices[j] for i, j in paires], device=service.device)
             edge_label_index = torch.stack([src, dst])
 
-            # --- UN SEUL decode() pour toutes les paires ---
             logits = service.model.decode(z_dict['medicament'], edge_label_index)
             probs = F.softmax(logits, dim=-1)
 
         for (i, j), p in zip(paires, probs):
             predicted_class_id = int(torch.argmax(p).item())
-            class_probs = {service.idx_to_class.get(str(k), f"classe_{k}"): round(float(p[k].item()), 4)
-                           for k in range(len(p))}
+            class_probs = {
+                service.idx_to_class.get(str(k), f"classe_{k}"): round(float(p[k].item()), 4)
+                for k in range(len(p))
+            }
+            # <--- NOUVEAU : Vérification de la présence réelle dans le thésaurus ANSM --->
+            idx_1 = indices[i]
+            idx_2 = indices[j]
+            pair_key = (min(idx_1, idx_2), max(idx_1, idx_2))
+            is_ansm_certified = pair_key in service.ansm_edges_set
+
             interactions.append(PredictionResponse(
-                code_cis_1=meds_valides[i], code_cis_2=meds_valides[j],
+                code_cis_1=meds_valides[i],
+                code_cis_2=meds_valides[j],
                 class_id=predicted_class_id,
                 niveau_gravite=service.idx_to_class.get(str(predicted_class_id), f"classe_{predicted_class_id}"),
                 probabilities=class_probs,
+                is_ansm=is_ansm_certified
             ))
 
-    return BatchPredictionResponse(
-        nb_medicaments=n, nb_paires_analysées=len(interactions) + len(erreurs),
-        interactions=interactions, erreurs_identification=erreurs,
-    )
+    # --- NOUVEAU : CALCUL DU SCORE DE RISQUE GLOBAL ---
+    max_score = 0.0
+    for inter in interactions:
+        pair_score = sum(POIDS_GRAVITE.get(lbl, 0.0) * prob for lbl, prob in inter.probabilities.items())
+        if pair_score > max_score:
+            max_score = pair_score
 
+    return BatchPredictionResponse(
+        nb_medicaments=n,
+        nb_paires_analysées=len(interactions) + len(erreurs),
+        riskScore=round(max_score, 2),
+        interactions=interactions,
+        erreurs_identification=erreurs,
+    )
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app_api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app_api:app", host="127.0.0.1", port=8080, reload=True)

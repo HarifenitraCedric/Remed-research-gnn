@@ -24,10 +24,12 @@ from torch_geometric.nn import HeteroConv, SAGEConv
 # Architecture du Réseau de Neurones GNN
 # ---------------------------------------------------------------------------
 class RemedHeteroGNN(nn.Module):
-    def __init__(self, num_patients, num_meds, embed_dim, hidden_dim, out_dim):
+    def __init__(self, num_patients, in_med_features, embed_dim, hidden_dim, out_dim):
         super().__init__()
         self.patient_emb = nn.Embedding(num_patients, embed_dim)
-        self.med_emb = nn.Embedding(num_meds, embed_dim)
+        
+        # Projection linéaire des 15 features de 'medicament' vers embed_dim
+        self.med_proj = nn.Linear(in_med_features, embed_dim)
 
         self.conv1 = HeteroConv({
             ('patient', 'a_prescrit', 'medicament'): SAGEConv((-1, -1), hidden_dim),
@@ -59,7 +61,12 @@ class RemedHeteroGNN(nn.Module):
         return self.decoder(torch.cat([x_src, x_dst], dim=-1))
 
     def forward(self, x_dict, edge_index_dict, edge_label_index):
-        z_dict = self.encode(x_dict, edge_index_dict)
+        # Projection des features de medicament via med_proj
+        x_proj = {
+            'patient': x_dict['patient'],
+            'medicament': self.med_proj(x_dict['medicament'])
+        }
+        z_dict = self.encode(x_proj, edge_index_dict)
         return self.decode(z_dict['medicament'], edge_label_index)
 
 
@@ -112,7 +119,7 @@ def sauvegarder_json_safe(chemin_relatif, obj):
 # ---------------------------------------------------------------------------
 # 1. Chargement du graphe d'origine
 # ---------------------------------------------------------------------------
-data = charger_torch_safe("graphe_heterogene_complet.pt")
+data = charger_torch_safe("graphe_heterogene_enrichi.pt")
 data_bidirect = T.ToUndirected()(data)
 rel = ('medicament', 'interagit_avec', 'medicament')
 labels_complet = torch.argmax(data_bidirect[rel].edge_attr, dim=-1)
@@ -167,12 +174,11 @@ torch.manual_seed(42)
 
 model_final = RemedHeteroGNN(
     num_patients=int(data_bidirect['patient'].num_nodes),
-    num_meds=num_meds_total,
+    in_med_features=data_bidirect['medicament'].x.shape[1], # 15
     embed_dim=64,
     hidden_dim=32,
     out_dim=16,
 )
-
 comptes = torch.bincount(labels_complet, minlength=4).float()
 poids = (1.0 / comptes.clamp(min=1))
 poids = poids / poids.sum() * 4
@@ -181,9 +187,8 @@ optimizer = torch.optim.Adam(model_final.parameters(), lr=0.01, weight_decay=5e-
 
 x_init = {
     'patient': model_final.patient_emb.weight,
-    'medicament': model_final.med_emb.weight
+    'medicament': data_bidirect['medicament'].x  # Tenseur [215, 15]
 }
-
 model_final.train()
 for epoch in range(1, 101):
     optimizer.zero_grad()

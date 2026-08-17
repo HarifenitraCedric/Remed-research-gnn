@@ -223,7 +223,7 @@
     "3": "precaution_emploi"
   },
   "metadata": {
-    "num_patients": 27,
+    "num_patients": 26,
     "num_medicaments": 215,
     "embed_dim": 64,
     "hidden_dim": 32,

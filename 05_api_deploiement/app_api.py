@@ -10,13 +10,12 @@ import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 import torch_geometric.transforms as T
-
-
-# =====================================================================
-# 1. Architecture RemedHeteroGNN (identique à train_heterognn_v2.py)
-# =====================================================================
 from torch_geometric.nn import HeteroConv, SAGEConv
 
+
+# =====================================================================
+# 1. Architecture RemedHeteroGNN
+# =====================================================================
 class RemedHeteroGNN(nn.Module):
     def __init__(self, num_patients: int, num_meds: int, embed_dim: int = 64, hidden_dim: int = 32, out_dim: int = 16):
         super().__init__()
@@ -77,7 +76,6 @@ class ModelService:
             mappings_path: str = "mappings_remed.json",
             graphe_path: str = "graphe_heterogene_complet.pt"
         ):
-            # 0. Résolution absolue du répertoire courant de app_api.py (05_api_deploiement)
             base_dir = Path(__file__).resolve().parent
 
             full_mappings_path = base_dir / mappings_path
@@ -102,6 +100,11 @@ class ModelService:
 
             # 2. Chargement de la structure du graphe
             data = torch.load(full_graphe_path, weights_only=False)
+
+            # Extraire les dimensions EXACTES avant la transformation bidirectionnelle
+            raw_num_patients = data['patient'].num_nodes if 'patient' in data.node_types else None
+            raw_num_meds = data['medicament'].num_nodes if 'medicament' in data.node_types else None
+
             self.data_bidirect = T.ToUndirected()(data).to(self.device)
 
             self.ansm_edges_set = set()
@@ -111,11 +114,19 @@ class ModelService:
                 for u, v in zip(edges[0].tolist(), edges[1].tolist()):
                     self.ansm_edges_set.add((min(u, v), max(u, v)))
 
-            # 3. Instanciation du modèle et chargement des poids
-            num_patients = metadata.get("num_patients", self.data_bidirect['patient'].num_nodes)
-            num_meds = metadata.get("num_medicaments", self.data_bidirect['medicament'].num_nodes)
+            # 3. Résolution robuste du nombre de nœuds pour l'instanciation du modèle
+            num_patients = metadata.get("num_patients") or raw_num_patients or 27
+            num_meds = metadata.get("num_medicaments") or raw_num_meds or 215
 
-# --- CODE CORRIGÉ ---
+            # Chargement de la structure du state_dict pour validation
+            state_dict = torch.load(full_weights_path, map_location=self.device)
+            
+            # Validation dynamique des dimensions à partir du checkpoint si disponible
+            if "patient_emb.weight" in state_dict:
+                num_patients = state_dict["patient_emb.weight"].shape[0]
+            if "med_emb.weight" in state_dict:
+                num_meds = state_dict["med_emb.weight"].shape[0]
+
             self.model = RemedHeteroGNN(
                 num_patients=num_patients,
                 num_meds=num_meds,
@@ -124,25 +135,20 @@ class ModelService:
                 out_dim=16
             )
 
-            state_dict = torch.load(full_weights_path, map_location=self.device)
             self.model.load_state_dict(state_dict)
             self.model.to(self.device)
-            self.model.eval()  # Désactive le Dropout pour l'inférence
+            self.model.eval()
 
-# --- CODE AMÉLIORÉ ---
     def resolve_med_index(self, identifier: str) -> int:
         clean_id = str(identifier).strip().upper()
 
-        # 1. Correspondance directe (ex: 'MED_0', 'N06BX')
         if clean_id in self.med_to_idx:
             return self.med_to_idx[clean_id]
 
-        # 2. Insensibilité à la casse
         for key in self.med_to_idx:
             if key.upper() == clean_id:
                 return self.med_to_idx[key]
 
-        # 3. Traitement du préfixe "MED_" -> extraction de l'index numérique
         if clean_id.startswith("MED_"):
             raw_num = clean_id.replace("MED_", "")
             if raw_num in self.med_to_idx:
@@ -154,7 +160,6 @@ class ModelService:
             except ValueError:
                 pass
 
-        # 4. Correspondance via mapping CIS -> ATC
         if self.cis_to_med and clean_id in self.cis_to_med:
             internal_code = self.cis_to_med[clean_id]
             if internal_code in self.med_to_idx:
@@ -204,7 +209,6 @@ class PredictionResponse(BaseModel):
     probabilities: Dict[str, float] = Field(..., description="Probabilités pour chacune des 4 classes")
     is_ansm: bool = Field(False, description="Vrai si l'interaction est issue du thésaurus ANSM, Faux si prédiction GNN pure")
 
-# --- NOUVEAUX SCHÉMAS POUR LE BATCH ---
 class BatchPredictionRequest(BaseModel):
     medicaments: List[str] = Field(
         ..., 
@@ -217,6 +221,8 @@ class BatchPredictionResponse(BaseModel):
     riskScore: float = Field(..., description="Score de risque global maximal calculé pour l'ordonnance (0 à 10)")
     interactions: List[PredictionResponse]
     erreurs_identification: List[Dict[str, str]]
+
+
 # =====================================================================
 # 5. Endpoints
 # =====================================================================
@@ -230,7 +236,6 @@ def health_check():
     }
 
 
-# Poids de gravité ANSM pour le calcul du score continu
 POIDS_GRAVITE = {
     "contre_indication": 10.0,
     "association_deconseillee": 7.0,
@@ -254,7 +259,6 @@ def predict_batch(payload: BatchPredictionRequest):
             erreurs_identification=[]
         )
 
-    # Résolution des indices, une seule fois
     indices, erreurs, meds_valides = [], [], []
     for m in meds:
         try:
@@ -286,7 +290,6 @@ def predict_batch(payload: BatchPredictionRequest):
                 service.idx_to_class.get(str(k), f"classe_{k}"): round(float(p[k].item()), 4)
                 for k in range(len(p))
             }
-            # <--- NOUVEAU : Vérification de la présence réelle dans le thésaurus ANSM --->
             idx_1 = indices[i]
             idx_2 = indices[j]
             pair_key = (min(idx_1, idx_2), max(idx_1, idx_2))
@@ -301,7 +304,6 @@ def predict_batch(payload: BatchPredictionRequest):
                 is_ansm=is_ansm_certified
             ))
 
-    # --- NOUVEAU : CALCUL DU SCORE DE RISQUE GLOBAL ---
     max_score = 0.0
     for inter in interactions:
         pair_score = sum(POIDS_GRAVITE.get(lbl, 0.0) * prob for lbl, prob in inter.probabilities.items())
@@ -315,6 +317,8 @@ def predict_batch(payload: BatchPredictionRequest):
         interactions=interactions,
         erreurs_identification=erreurs,
     )
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app_api:app", host="127.0.0.1", port=8080, reload=True)
+    uvicorn.run(app, host="127.0.0.1", port=8080, reload=True)
